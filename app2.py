@@ -19,9 +19,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import mediapipe as mp  # for landmark enum compatibility
+import mediapipe as mp
 
 # ─────────────────────────────────────────────
 # CONFIG CONSTANTS & DEFAULTS
@@ -157,6 +155,12 @@ def detect_local_minimum(arr, threshold=10):
     mid = len(arr) // 2
     return arr[mid] < min(arr[:mid] + arr[mid+1:]) and (arr[mid] + threshold) <= min(arr[:mid] + arr[mid+1:])
 
+def flip_if_upside_down(frame, lm_pixel):
+    if "left_hip" in lm_pixel and "left_shoulder" in lm_pixel:
+        if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
+            return cv2.flip(frame, -1)  # 180 degree rotation
+    return frame
+
 # ─────────────────────────────────────────────
 # VISUAL PANELS (enhanced with kick depth & breathing)
 # ─────────────────────────────────────────────
@@ -209,7 +213,7 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, kick_dept
     rdy = 60 * math.sin(math.radians(roll))
     cv2.line(frame, (px+140, py+260), (int(px+140+rdx), int(py+260+rdy)), rc, 5)
 
-    # Kick depth (new)
+    # Kick depth (new line)
     kdc = get_zone_color(kick_depth * 100, DEFAULT_KICK_DEPTH_GOOD, (0.1, 0.8))
     cv2.putText(frame, f"Kick Depth: {kick_depth:.2f}", (px+10, py+190), cv2.FONT_HERSHEY_SIMPLEX, 0.7, kdc, 2)
     kdx = 60 * min(kick_depth / 1.0, 1.0)  # cap visible length
@@ -230,7 +234,7 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, kick_dept
     cv2.putText(frame, stxt, (px+10, py+ph-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 1)
 
 # ─────────────────────────────────────────────
-# ANALYZER CLASS (Tasks API + all improvements)
+# ANALYZER CLASS
 # ─────────────────────────────────────────────
 
 class SwimAnalyzer:
@@ -239,24 +243,13 @@ class SwimAnalyzer:
         self.conf_thresh = conf_thresh
         self.yaw_thresh = yaw_thresh
 
-        # Modern MediaPipe Tasks API
-        BaseOptions = python.BaseOptions
-        PoseLandmarker = vision.PoseLandmarker
-        PoseLandmarkerOptions = vision.PoseLandmarkerOptions
-        VisionRunningMode = vision.RunningMode
-
-        base_options = BaseOptions(
-            model_asset_path="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-        )
-        options = PoseLandmarkerOptions(
-            base_options=base_options,
-            running_mode=VisionRunningMode.VIDEO,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
+        self.pose = mp.solutions.pose.Pose(
+            min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-            output_segmentation_masks=False
+            model_complexity=1
         )
-        self.pose_landmarker = PoseLandmarker.create_from_options(options)
+        self.drawing = mp.solutions.drawing_utils
+        self.styles = mp.solutions.drawing_styles
 
         self.metrics: List[FrameMetrics] = []
         self.stroke_times = []
@@ -270,68 +263,66 @@ class SwimAnalyzer:
         self.worst_dev = -float('inf')
         self.best_bytes = self.worst_bytes = None
 
-        # Smoothing
+        # Smoothing buffers
         self.torso_buffer = deque(maxlen=7)
         self.forearm_buffer = deque(maxlen=7)
         self.kick_depth_buffer = deque(maxlen=7)
 
     def process(self, frame, t):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp_ms = int(t * 1000)
-
-        result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-
-        if not result.pose_landmarks:
+        res = self.pose.process(rgb)
+        if not res.pose_landmarks:
             return frame, None
 
-        landmarks = result.pose_landmarks[0]  # first pose
-        lm = {}
-        for name in ["nose","left_shoulder","right_shoulder","left_elbow","right_elbow",
-                     "left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]:
+        h, w = frame.shape[:2]
+        lm_pixel = {}
+        lm_norm = {}
+        names = ["nose","left_shoulder","right_shoulder","left_elbow","right_elbow",
+                 "left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]
+        vis_sum = 0
+        for name in names:
             idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
-            p = landmarks[idx]
-            lm[name] = (p.x * frame.shape[1], p.y * frame.shape[0])
+            p = res.pose_landmarks.landmark[idx]
+            lm_pixel[name] = (p.x * w, p.y * h)
+            lm_norm[name] = (p.x, p.y)
+            vis_sum += p.visibility
 
-        conf = statistics.mean([landmarks[getattr(mp.solutions.pose.PoseLandmark, n.upper())].presence
-                                for n in ["left_shoulder","right_shoulder","left_hip","right_hip"]])
-
+        conf = vis_sum / len(names)
         if conf < self.conf_thresh:
             return frame, None
 
-        # Flip upside-down if needed
-        if lm["left_hip"][1] < lm["left_shoulder"][1]:
+        # Flip if upside-down
+        if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
             frame = cv2.flip(frame, -1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-            if not result.pose_landmarks:
+            res = self.pose.process(rgb)
+            if not res.pose_landmarks:
                 return frame, None
-            landmarks = result.pose_landmarks[0]
-            for name in lm:
+            # Re-extract after flip
+            for name in names:
                 idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
-                p = landmarks[idx]
-                lm[name] = (p.x * frame.shape[1], p.y * frame.shape[0])
+                p = res.pose_landmarks.landmark[idx]
+                lm_pixel[name] = (p.x * w, p.y * h)
 
         elbow = min(
-            calculate_angle(lm["left_shoulder"], lm["left_elbow"], lm["left_wrist"]),
-            calculate_angle(lm["right_shoulder"], lm["right_elbow"], lm["right_wrist"])
+            calculate_angle(lm_pixel["left_shoulder"], lm_pixel["left_elbow"], lm_pixel["left_wrist"]),
+            calculate_angle(lm_pixel["right_shoulder"], lm_pixel["right_elbow"], lm_pixel["right_wrist"])
         )
 
         roll = abs(math.degrees(math.atan2(
-            lm["left_shoulder"][1] - lm["right_shoulder"][1],
-            lm["left_shoulder"][0] - lm["right_shoulder"][0]
+            lm_pixel["left_shoulder"][1] - lm_pixel["right_shoulder"][1],
+            lm_pixel["left_shoulder"][0] - lm_pixel["right_shoulder"][0]
         )))
 
-        knee_l = calculate_angle(lm["left_hip"], lm["left_knee"], lm["left_ankle"])
-        knee_r = calculate_angle(lm["right_hip"], lm["right_knee"], lm["right_ankle"])
+        knee_l = calculate_angle(lm_pixel["left_hip"], lm_pixel["left_knee"], lm_pixel["left_ankle"])
+        knee_r = calculate_angle(lm_pixel["right_hip"], lm_pixel["right_knee"], lm_pixel["right_ankle"])
         kick_sym = abs(knee_l - knee_r)
-        kick_depth_raw = compute_kick_depth_proxy(lm)
+        kick_depth_raw = compute_kick_depth_proxy(lm_pixel)
 
-        symmetry_hips = abs(lm["left_hip"][0] - lm["right_hip"][0]) / frame.shape[1] * 100
+        symmetry_hips = abs(lm_pixel["left_hip"][0] - lm_pixel["right_hip"][0]) / w * 100
 
-        wrist_y = lm["left_wrist"][1]
-        shoulder_y = lm["left_shoulder"][1]
+        wrist_y = lm_pixel["left_wrist"][1]
+        shoulder_y = lm_pixel["left_shoulder"][1]
         underwater = wrist_y > shoulder_y + 20
         phase = "Recovery"
         if underwater:
@@ -340,9 +331,9 @@ class SwimAnalyzer:
             else: phase = "Push"
 
         yaw = 0
-        if "nose" in lm:
-            mid_s = (lm["left_shoulder"][0] + lm["right_shoulder"][0]) / 2
-            yaw = (lm["nose"][0] - mid_s) / abs(lm["right_shoulder"][0] - lm["left_shoulder"][0] or 1)
+        if "nose" in lm_pixel:
+            mid_s = (lm_pixel["left_shoulder"][0] + lm_pixel["right_shoulder"][0]) / 2
+            yaw = (lm_pixel["nose"][0] - mid_s) / abs(lm_pixel["right_shoulder"][0] - lm_pixel["left_shoulder"][0] or 1)
         if abs(yaw) > self.yaw_thresh:
             side = 'R' if yaw > 0 else 'L'
             if side == self.breath_side:
@@ -362,9 +353,9 @@ class SwimAnalyzer:
             if not self.stroke_times or ct - self.stroke_times[-1] >= 0.5:
                 self.stroke_times.append(ct)
 
-        torso_raw = compute_torso_lean(lm)
-        forearm_raw = compute_forearm_vertical(lm)
-        kick_depth_raw = compute_kick_depth_proxy(lm)
+        torso_raw = compute_torso_lean(lm_pixel)
+        forearm_raw = compute_forearm_vertical(lm_pixel)
+        kick_depth_raw = compute_kick_depth_proxy(lm_pixel)
 
         self.torso_buffer.append(torso_raw)
         self.forearm_buffer.append(forearm_raw)
@@ -375,7 +366,7 @@ class SwimAnalyzer:
         kick_depth = statistics.mean(self.kick_depth_buffer) if self.kick_depth_buffer else kick_depth_raw
         roll_abs = abs(roll)
 
-        self.drawing.draw_landmarks(frame, landmarks, mp.solutions.pose.POSE_CONNECTIONS,
+        self.drawing.draw_landmarks(frame, res.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS,
                                     landmark_drawing_spec=self.styles.get_default_pose_landmarks_style())
 
         draw_technique_panel(frame, w-200, "YOUR STROKE", torso, forearm, roll_abs, kick_depth, phase, False, self.breath_side)
@@ -411,10 +402,10 @@ class SwimAnalyzer:
         if not self.metrics: return SessionSummary(0,0,0,0,0,0,0,0,0,0,0,"No data",1.0,None,None)
 
         d = self.metrics[-1].time_s
-        scores = [m.score for m in self.metrics if m.confidence >= self.conf_thresh]
-        rolls = [m.body_roll for m in self.metrics if m.confidence >= self.conf_thresh]
-        ksyms = [m.kick_symmetry for m in self.metrics if m.confidence >= self.conf_thresh]
-        kdepths = [m.kick_depth_proxy for m in self.metrics if m.confidence >= self.conf_thresh]
+        scores = [m.score for m in self.metrics if m.confidence >= DEFAULT_CONF_THRESHOLD]
+        rolls = [m.body_roll for m in self.metrics if m.confidence >= DEFAULT_CONF_THRESHOLD]
+        ksyms = [m.kick_symmetry for m in self.metrics if m.confidence >= DEFAULT_CONF_THRESHOLD]
+        kdepths = [m.kick_depth_proxy for m in self.metrics if m.confidence >= DEFAULT_CONF_THRESHOLD]
         confs = [m.confidence for m in self.metrics]
 
         sr = 0
@@ -447,7 +438,7 @@ class SwimAnalyzer:
         )
 
 # ─────────────────────────────────────────────
-# PLOTS, PDF, CSV, ZIP (unchanged from previous, but with kick & breathing)
+# PLOTS
 # ─────────────────────────────────────────────
 
 def generate_plots(analyzer):
@@ -466,7 +457,10 @@ def generate_plots(analyzer):
     buf = io.BytesIO(); plt.savefig(buf, format="png", dpi=150, bbox_inches="tight"); plt.close(fig); buf.seek(0)
     return buf
 
-# PDF report with embedded best/worst frames (same as previous but with kick depth in metrics table)
+# ─────────────────────────────────────────────
+# PDF REPORT (with embedded best/worst frames)
+# ─────────────────────────────────────────────
+
 def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.BytesIO) -> io.BytesIO:
     buffer = io.BytesIO()
     pdf = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
@@ -579,8 +573,8 @@ def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp, ana
 # ─────────────────────────────────────────────
 
 def main():
-    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro v4.2 – All Improvements")
-    st.title("Freestyle Swim Technique Analyzer Pro – v4.2 (Fully Polished & Configurable)")
+    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro v4.2 – Fully Polished")
+    st.title("Freestyle Swim Technique Analyzer Pro – v4.2 (All Improvements Applied)")
 
     with st.sidebar:
         st.header("Athlete & Analysis Settings")
