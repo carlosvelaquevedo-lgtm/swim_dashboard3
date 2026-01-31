@@ -5,7 +5,7 @@ import math
 import statistics
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional
 import tempfile
 import os
 import datetime
@@ -20,6 +20,25 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 import mediapipe as mp
+
+# ─────────────────────────────────────────────
+# CONFIG (now partially configurable via sidebar)
+# ─────────────────────────────────────────────
+
+DEFAULT_CONF_THRESHOLD = 0.4
+DEFAULT_YAW_THRESHOLD = 0.15
+DEFAULT_MIN_BREATH_GAP_S = 1.0
+DEFAULT_MIN_BREATH_HOLD_FRAMES = 4
+
+# Ideal ranges (configurable)
+DEFAULT_TORSO_GOOD = (4, 12)
+DEFAULT_TORSO_OK = (0, 18)
+DEFAULT_FOREARM_GOOD = (0, 35)
+DEFAULT_FOREARM_OK = (0, 60)
+DEFAULT_ROLL_GOOD = (35, 55)
+DEFAULT_ROLL_OK = (25, 65)
+DEFAULT_KICK_SYM_MAX_GOOD = 15
+DEFAULT_KICK_DEPTH_GOOD = (0.25, 0.6)
 
 # ─────────────────────────────────────────────
 # ENUMS & DATA MODELS
@@ -126,7 +145,7 @@ def compute_kick_depth_proxy(lm_pixel):
     sh_dist = abs(lm_pixel["left_shoulder"][1] - lm_pixel["left_hip"][1]) or 1.0
     return ((abs(knee_l_y - hip_y) + abs(knee_r_y - hip_y)) / 2) / sh_dist
 
-def get_zone_color(val, good=(0,0), ok=(0,0)):
+def get_zone_color(val, good, ok):
     if good[0] <= val <= good[1]: return (0, 180, 0)
     if ok[0] <= val <= ok[1]: return (0, 220, 220)
     return (0, 0, 220)
@@ -141,8 +160,21 @@ def detect_view(lm_norm):
     if r < 0.4: return CameraView.SIDE
     return CameraView.DIAGONAL
 
+def detect_local_minimum(arr, threshold=10):
+    if len(arr) < 3: return False
+    mid = len(arr) // 2
+    return arr[mid] < min(arr[:mid] + arr[mid+1:]) and (arr[mid] + threshold) <= min(arr[:mid] + arr[mid+1:])
+
+def flip_if_upside_down(frame, lm):
+    """Basic upside-down detection: if hips are above shoulders"""
+    left_hip_y = lm["left_hip"][1]
+    left_shoulder_y = lm["left_shoulder"][1]
+    if left_hip_y < left_shoulder_y:  # hips above shoulders → upside down
+        return cv2.flip(frame, -1)  # 180 degree rotation
+    return frame
+
 # ─────────────────────────────────────────────
-# VISUAL PANELS
+# VISUAL PANELS (enhanced with kick depth line)
 # ─────────────────────────────────────────────
 
 def draw_simplified_silhouette(frame, x, y, color=(180,180,180), th=3):
@@ -153,10 +185,10 @@ def draw_simplified_silhouette(frame, x, y, color=(180,180,180), th=3):
     cv2.line(frame, (x, y+70), (x-35, y+130), color, th)
     cv2.line(frame, (x, y+70), (x+35, y+130), color, th)
 
-def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, phase, is_ideal=False):
+def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, kick_depth, phase, is_ideal=False, breath_side='N'):
     h, w = frame.shape[:2]
     px, py = origin_x - 140, 30
-    pw, ph = 280, 360
+    pw, ph = 280, 420
     ov = frame.copy()
     cv2.rectangle(ov, (px, py), (px+pw, py+ph), (0,0,0), -1)
     cv2.addWeighted(ov, 0.65, frame, 0.35, 0, frame)
@@ -164,31 +196,49 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, phase, is
     cv2.putText(frame, title.upper(), (px+10, py+30), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                 (255,255,255) if not is_ideal else (200,200,255), 2)
 
-    draw_simplified_silhouette(frame, px+140, py+180, (160,160,160) if is_ideal else (200,200,200), 2)
+    draw_simplified_silhouette(frame, px+140, py+200, (160,160,160) if is_ideal else (200,200,200), 2)
 
-    tc = get_zone_color(abs(torso), (4,12), (0,18))
+    # Torso
+    tc = get_zone_color(abs(torso), DEFAULT_TORSO_GOOD, DEFAULT_TORSO_OK)
     tlen = 80
     tdx = tlen * math.sin(math.radians(torso))
     tdy = tlen * math.cos(math.radians(torso))
-    cv2.line(frame, (px+140, py+80), (int(px+140+tdx), int(py+80+tdy)), tc, 6)
-    cv2.putText(frame, f"Torso: {torso:.1f}°", (px+10, py+70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, tc, 2)
+    cv2.line(frame, (px+140, py+100), (int(px+140+tdx), int(py+100+tdy)), tc, 6)
+    cv2.putText(frame, f"Torso Lean: {torso:.1f}°", (px+10, py+70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, tc, 2)
 
+    # Forearm
     if phase in ("Pull", "Push"):
-        fc = get_zone_color(forearm, (0,35), (0,60))
-        ftxt = f"Forearm: {forearm:.1f}°"
+        fc = get_zone_color(forearm, DEFAULT_FOREARM_GOOD, DEFAULT_FOREARM_OK)
+        ftxt = f"Forearm to Vert: {forearm:.1f}°"
     else:
         fc = (180,180,180)
         ftxt = "Forearm n/a"
     cdx = 80 * math.sin(math.radians(forearm))
     cdy = 80 * math.cos(math.radians(forearm))
-    cv2.line(frame, (px+220, py+80), (int(px+220+cdx), int(py+80+cdy)), fc, 6)
+    cv2.line(frame, (px+220, py+100), (int(px+220+cdx), int(py+100+cdy)), fc, 6)
     cv2.putText(frame, ftxt, (px+10, py+110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, fc, 2)
 
-    rc = get_zone_color(roll, (35,55), (25,65))
-    cv2.putText(frame, f"Rotation: {roll:.1f}°", (px+10, py+150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, rc, 2)
+    # Body Rotation
+    rc = get_zone_color(roll, DEFAULT_ROLL_GOOD, DEFAULT_ROLL_OK)
+    cv2.putText(frame, f"Body Rot: {roll:.1f}°", (px+10, py+150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, rc, 2)
     rdx = 60 * math.cos(math.radians(roll))
     rdy = 60 * math.sin(math.radians(roll))
     cv2.line(frame, (px+140, py+260), (int(px+140+rdx), int(py+260+rdy)), rc, 5)
+
+    # Kick Depth (new line)
+    kdc = get_zone_color(kick_depth * 100, DEFAULT_KICK_DEPTH_GOOD, (0.1, 0.8))
+    cv2.putText(frame, f"Kick Depth: {kick_depth:.2f}", (px+10, py+190), cv2.FONT_HERSHEY_SIMPLEX, 0.7, kdc, 2)
+    kdx = 60 * (kick_depth / 1.0)  # scale to visible length
+    cv2.line(frame, (px+140, py+320), (int(px+140+kdx), py+320), kdc, 5)
+
+    # Breathing icon
+    bcolor = (0,255,0) if breath_side == 'N' else (255,165,0) if breath_side == 'L' else (0,191,255)
+    btxt = "Breath: Neutral" if breath_side == 'N' else f"Breath: {'Left' if breath_side == 'L' else 'Right'}"
+    cv2.putText(frame, btxt, (px+10, py+350), cv2.FONT_HERSHEY_SIMPLEX, 0.7, bcolor, 2)
+    if breath_side != 'N':
+        arrow_x = px + 220
+        arrow_y = py + 350
+        cv2.arrowedLine(frame, (arrow_x, arrow_y), (arrow_x - 40 if breath_side == 'L' else arrow_x + 40, arrow_y), bcolor, 2, tipLength=0.3)
 
     stxt = "IDEAL REFERENCE" if is_ideal else "YOUR STROKE"
     cv2.putText(frame, stxt, (px+10, py+ph-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 1)
@@ -198,9 +248,15 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, phase, is
 # ─────────────────────────────────────────────
 
 class SwimAnalyzer:
-    def __init__(self, athlete: AthleteProfile):
+    def __init__(self, athlete: AthleteProfile, conf_thresh, yaw_thresh):
         self.athlete = athlete
-        self.pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5, model_complexity=1)
+        self.conf_thresh = conf_thresh
+        self.yaw_thresh = yaw_thresh
+        self.pose = mp.solutions.pose.Pose(
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            model_complexity=1
+        )
         self.drawing = mp.solutions.drawing_utils
         self.styles = mp.solutions.drawing_styles
 
@@ -215,6 +271,11 @@ class SwimAnalyzer:
         self.best_dev = float('inf')
         self.worst_dev = -float('inf')
         self.best_bytes = self.worst_bytes = None
+
+        # Smoothing buffers
+        self.torso_buffer = deque(maxlen=7)
+        self.forearm_buffer = deque(maxlen=7)
+        self.kick_depth_buffer = deque(maxlen=7)
 
     def process(self, frame, t):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -233,8 +294,22 @@ class SwimAnalyzer:
         conf = statistics.mean([res.pose_landmarks.landmark[getattr(mp.solutions.pose.PoseLandmark, n.upper())].visibility
                                 for n in ["left_shoulder","right_shoulder","left_hip","right_hip"]])
 
-        if conf < 0.4:
+        if conf < self.conf_thresh:
             return frame, None
+
+        # Flip if upside-down
+        if "left_hip" in lm and "left_shoulder" in lm:
+            if lm["left_hip"][1] < lm["left_shoulder"][1]:
+                frame = cv2.flip(frame, -1)
+                # Re-extract landmarks after flip
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = self.pose.process(rgb)
+                if not res.pose_landmarks:
+                    return frame, None
+                for name in lm:
+                    idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
+                    p = res.pose_landmarks.landmark[idx]
+                    lm[name] = (p.x * w, p.y * h)
 
         elbow = min(
             calculate_angle(lm["left_shoulder"], lm["left_elbow"], lm["left_wrist"]),
@@ -249,7 +324,7 @@ class SwimAnalyzer:
         knee_l = calculate_angle(lm["left_hip"], lm["left_knee"], lm["left_ankle"])
         knee_r = calculate_angle(lm["right_hip"], lm["right_knee"], lm["right_ankle"])
         kick_sym = abs(knee_l - knee_r)
-        kick_depth = compute_kick_depth_proxy(lm)
+        kick_depth_raw = compute_kick_depth_proxy(lm)
 
         symmetry_hips = abs(lm["left_hip"][0] - lm["right_hip"][0]) / w * 100
 
@@ -266,37 +341,46 @@ class SwimAnalyzer:
         if "nose" in lm:
             mid_s = (lm["left_shoulder"][0] + lm["right_shoulder"][0]) / 2
             yaw = (lm["nose"][0] - mid_s) / abs(lm["right_shoulder"][0] - lm["left_shoulder"][0] or 1)
-        if abs(yaw) > 0.15:
+        if abs(yaw) > self.yaw_thresh:
             side = 'R' if yaw > 0 else 'L'
             if side == self.breath_side:
                 self.breath_persist += 1
             else:
                 self.breath_persist = 1
                 self.breath_side = side
-            if self.breath_persist >= 4 and t - self.last_breath >= 1.0:
+            if self.breath_persist >= MIN_BREATH_HOLD_FRAMES and t - self.last_breath >= DEFAULT_MIN_BREATH_GAP_S:
                 if side == 'L': self.breath_l += 1
                 else: self.breath_r += 1
                 self.last_breath = t
 
         self.elbow_win.append(elbow)
         self.time_win.append(t)
-        if len(self.elbow_win) >= 9 and detect_local_minimum(list(self.elbow_win), 10)[0]:
+        if len(self.elbow_win) >= 9 and detect_local_minimum(list(self.elbow_win)):
             ct = self.time_win[4]
             if not self.stroke_times or ct - self.stroke_times[-1] >= 0.5:
                 self.stroke_times.append(ct)
 
-        torso = compute_torso_lean(lm)
-        forearm = compute_forearm_vertical(lm)
+        torso_raw = compute_torso_lean(lm)
+        forearm_raw = compute_forearm_vertical(lm)
+        kick_depth_raw = compute_kick_depth_proxy(lm)
+
+        self.torso_buffer.append(torso_raw)
+        self.forearm_buffer.append(forearm_raw)
+        self.kick_depth_buffer.append(kick_depth_raw)
+
+        torso = statistics.mean(self.torso_buffer) if self.torso_buffer else torso_raw
+        forearm = statistics.mean(self.forearm_buffer) if self.forearm_buffer else forearm_raw
+        kick_depth = statistics.mean(self.kick_depth_buffer) if self.kick_depth_buffer else kick_depth_raw
         roll_abs = abs(roll)
 
         self.drawing.draw_landmarks(frame, res.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS,
                                     landmark_drawing_spec=self.styles.get_default_pose_landmarks_style())
 
-        draw_technique_panel(frame, w-200, "YOUR STROKE", torso, forearm, roll_abs, phase, False)
-        draw_technique_panel(frame, 200, "IDEAL REFERENCE", 8.0, 20.0, 45.0, "PULL", True)
+        draw_technique_panel(frame, w-200, "YOUR STROKE", torso, forearm, roll_abs, kick_depth, phase, False, self.breath_side)
+        draw_technique_panel(frame, 200, "IDEAL REFERENCE", 8.0, 20.0, 45.0, 0.4, "PULL", True, 'N')
 
         if phase == "Pull":
-            dev = abs(elbow - 110)
+            dev = abs(elbow - ELBOW_IDEAL_CENTER)
             if dev < self.best_dev:
                 self.best_dev = dev
                 _, buf = cv2.imencode('.jpg', frame)
@@ -306,21 +390,29 @@ class SwimAnalyzer:
                 _, buf = cv2.imencode('.jpg', frame)
                 self.worst_bytes = buf.tobytes()
 
+        # Realistic scoring
+        torso_dev = max(0, min(abs(torso - 8), 20)) / 20 * 30
+        forearm_dev = max(0, min(forearm - 35, 65 - forearm)) / 65 * 25
+        roll_dev = max(0, min(abs(roll_abs - 45), 20)) / 20 * 20
+        kick_sym_dev = max(0, kick_sym / KICK_SYM_GOOD) * 15
+        kick_depth_dev = 0 if KICK_DEPTH_GOOD[0] <= kick_depth <= KICK_DEPTH_GOOD[1] else 10
+        score = max(0, 100 - (torso_dev + forearm_dev + roll_dev + kick_sym_dev + kick_depth_dev))
+
         metrics = FrameMetrics(t, elbow, knee_l, knee_r, kick_sym, kick_depth,
-                               symmetry_hips, 80.0, roll_abs, torso, forearm, phase,
+                               symmetry_hips, score, roll_abs, torso, forearm, phase,
                                self.breath_side if self.breath_side != 'N' else "-", conf)
         self.metrics.append(metrics)
 
-        return frame, 80.0
+        return frame, score
 
     def get_summary(self):
-        if not self.metrics: return SessionSummary(0,0,0,0,0,0,0,0,0,0,0,"No data",1.0)
+        if not self.metrics: return SessionSummary(0,0,0,0,0,0,0,0,0,0,0,"No data",1.0,None,None)
 
         d = self.metrics[-1].time_s
-        scores = [m.score for m in self.metrics if m.confidence >= 0.4]
-        rolls = [m.body_roll for m in self.metrics if m.confidence >= 0.4]
-        ksyms = [m.kick_symmetry for m in self.metrics if m.confidence >= 0.4]
-        kdepths = [m.kick_depth_proxy for m in self.metrics if m.confidence >= 0.4]
+        scores = [m.score for m in self.metrics if m.confidence >= CONFIDENCE_THRESHOLD]
+        rolls = [m.body_roll for m in self.metrics if m.confidence >= CONFIDENCE_THRESHOLD]
+        ksyms = [m.kick_symmetry for m in self.metrics if m.confidence >= CONFIDENCE_THRESHOLD]
+        kdepths = [m.kick_depth_proxy for m in self.metrics if m.confidence >= CONFIDENCE_THRESHOLD]
         confs = [m.confidence for m in self.metrics]
 
         sr = 0
@@ -329,6 +421,10 @@ class SwimAnalyzer:
             if dur > 0.1: sr = 60 * (len(self.stroke_times)-1) / dur
 
         bpm = (self.breath_l + self.breath_r) / (d/60) if d > 0 else 0
+
+        avg_kick_sym = statistics.mean(ksyms) if ksyms else 0
+        avg_kick_depth = statistics.mean(kdepths) if kdepths else 0
+        kick_status = "Good" if avg_kick_sym < DEFAULT_KICK_SYM_MAX_GOOD and DEFAULT_KICK_DEPTH_GOOD[0] < avg_kick_depth < DEFAULT_KICK_DEPTH_GOOD[1] else "Needs Work"
 
         return SessionSummary(
             duration_s=d,
@@ -340,63 +436,45 @@ class SwimAnalyzer:
             breath_left=self.breath_l,
             breath_right=self.breath_r,
             total_strokes=len(self.stroke_times),
-            avg_kick_symmetry=statistics.mean(ksyms) if ksyms else 0,
-            avg_kick_depth=statistics.mean(kdepths) if kdepths else 0,
-            kick_status="Good" if statistics.mean(ksyms)<15 and 0.25<statistics.mean(kdepths)<0.6 else "Needs Work",
+            avg_kick_symmetry=avg_kick_sym,
+            avg_kick_depth=avg_kick_depth,
+            kick_status=kick_status,
             avg_confidence=statistics.mean(confs) if confs else 1.0,
             best_frame_bytes=self.best_bytes,
             worst_frame_bytes=self.worst_bytes
         )
 
 # ─────────────────────────────────────────────
-# PLOTS (expanded)
+# PLOTS
 # ─────────────────────────────────────────────
 
 def generate_plots(analyzer):
     if not analyzer.metrics: return io.BytesIO()
-
     times = [m.time_s for m in analyzer.metrics]
     plt.style.use('dark_background')
     fig, axs = plt.subplots(4, 1, figsize=(12, 16))
-
     axs[0].plot(times, [m.body_roll for m in analyzer.metrics], label="Body Roll", color='purple')
-    axs[0].axhspan(35, 55, color='green', alpha=0.2)
-    axs[0].set_title("Body Roll Over Time")
-    axs[0].legend()
-
+    axs[0].axhspan(DEFAULT_ROLL_GOOD[0], DEFAULT_ROLL_GOOD[1], color='green', alpha=0.2)
+    axs[0].set_title("Body Roll Over Time"); axs[0].legend()
     axs[1].plot(times, [m.kick_symmetry for m in analyzer.metrics], label="Kick Symmetry", color='orange')
-    axs[1].axhline(15, color='red', linestyle='--')
-    axs[1].set_title("Kick Symmetry (°)")
-    axs[1].legend()
-
+    axs[1].axhline(DEFAULT_KICK_SYM_MAX_GOOD, color='red', linestyle='--'); axs[1].set_title("Kick Symmetry (°)"); axs[1].legend()
     axs[2].plot(times, [m.kick_depth_proxy for m in analyzer.metrics], label="Kick Depth Proxy", color='cyan')
-    axs[2].axhspan(0.25, 0.6, color='green', alpha=0.2)
-    axs[2].set_title("Kick Depth Proxy (normalized)")
-    axs[2].legend()
-
-    axs[3].plot(times, [m.score for m in analyzer.metrics], label="Technique Score", color='lime')
-    axs[3].set_title("Technique Score Over Time")
-    axs[3].legend()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
+    axs[2].axhspan(DEFAULT_KICK_DEPTH_GOOD[0], DEFAULT_KICK_DEPTH_GOOD[1], color='green', alpha=0.2); axs[2].set_title("Kick Depth Proxy (norm)"); axs[2].legend()
+    axs[3].plot(times, [m.score for m in analyzer.metrics], label="Technique Score", color='lime'); axs[3].set_title("Technique Score Over Time"); axs[3].legend()
+    buf = io.BytesIO(); plt.savefig(buf, format="png", dpi=150, bbox_inches="tight"); plt.close(fig); buf.seek(0)
     return buf
 
 # ─────────────────────────────────────────────
-# PDF REPORT (expanded with kick metrics)
+# PDF REPORT (with embedded best/worst frames)
 # ─────────────────────────────────────────────
 
 def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.BytesIO) -> io.BytesIO:
     buffer = io.BytesIO()
     pdf = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
-
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name='CustomTitle', fontSize=24, textColor=colors.HexColor('#06b6d4'), spaceAfter=20))
 
     story = []
-
     story.append(Paragraph("Freestyle Swimming Technique Analysis Report", styles['CustomTitle']))
     story.append(Spacer(1, 0.2*inch))
 
@@ -405,7 +483,7 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
         ['File', filename],
         ['Duration', f"{summary.duration_s:.1f}s"],
         ['Date', datetime.datetime.now().strftime("%Y-%m-%d %H:%M")],
-        ['Confidence', f"{summary.avg_confidence*100:.1f}%"]
+        ['Avg Confidence', f"{summary.avg_confidence*100:.1f}%"]
     ]
     story.append(Table(session_data).setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)])))
     story.append(Spacer(1, 0.3*inch))
@@ -416,12 +494,28 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
         ['Technique Score', f"{summary.avg_score:.1f}/100", 'Good' if summary.avg_score >= 70 else 'Needs Work'],
         ['Stroke Rate', f"{summary.stroke_rate:.1f} spm", 'Good'],
         ['Breaths/min', f"{summary.breaths_per_min:.1f}", 'Balanced' if abs(summary.breath_left - summary.breath_right) <= 5 else 'Asymmetric'],
-        ['Avg Body Roll', f"{summary.avg_body_roll:.1f}°", 'Good' if 35 <= summary.avg_body_roll <= 55 else 'Check'],
-        ['Max Body Roll', f"{summary.max_body_roll:.1f}°", 'Good' if summary.max_body_roll <= 55 else 'Excessive'],
+        ['Avg Body Roll', f"{summary.avg_body_roll:.1f}°", 'Good' if DEFAULT_ROLL_GOOD[0] <= summary.avg_body_roll <= DEFAULT_ROLL_GOOD[1] else 'Check'],
+        ['Max Body Roll', f"{summary.max_body_roll:.1f}°", 'Good' if summary.max_body_roll <= DEFAULT_ROLL_GOOD[1] else 'Excessive'],
         ['Kick Symmetry', f"{summary.avg_kick_symmetry:.1f}°", summary.kick_status],
         ['Kick Depth Proxy', f"{summary.avg_kick_depth:.2f}", 'Good']
     ]
     story.append(Table(metrics_data).setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)])))
+
+    if summary.best_frame_bytes or summary.worst_frame_bytes:
+        story.append(Paragraph("Best & Worst Frames (Pull Phase)", styles['Heading2']))
+        if summary.best_frame_bytes:
+            best_img = RLImage(io.BytesIO(summary.best_frame_bytes))
+            best_img.drawWidth = 3*inch
+            best_img.drawHeight = 2*inch
+            story.append(Paragraph("Best Pull Frame", styles['Normal']))
+            story.append(best_img)
+        if summary.worst_frame_bytes:
+            worst_img = RLImage(io.BytesIO(summary.worst_frame_bytes))
+            worst_img.drawWidth = 3*inch
+            worst_img.drawHeight = 2*inch
+            story.append(Paragraph("Worst Pull Frame", styles['Normal']))
+            story.append(worst_img)
+        story.append(Spacer(1, 0.2*inch))
 
     if summary.drills:
         story.append(Paragraph("Recommended Drills", styles['Heading2']))
@@ -446,10 +540,6 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
     buffer.seek(0)
     return buffer
 
-# ─────────────────────────────────────────────
-# CSV & ZIP
-# ─────────────────────────────────────────────
-
 def export_to_csv(analyzer):
     data = {
         'time_s': [m.time_s for m in analyzer.metrics],
@@ -461,7 +551,8 @@ def export_to_csv(analyzer):
         'forearm_vertical': [m.forearm_vertical for m in analyzer.metrics],
         'phase': [m.phase for m in analyzer.metrics],
         'breath_state': [m.breath_state for m in analyzer.metrics],
-        'confidence': [m.confidence for m in analyzer.metrics]
+        'confidence': [m.confidence for m in analyzer.metrics],
+        'score': [m.score for m in analyzer.metrics]
     }
     df = pd.DataFrame(data)
     buf = io.BytesIO()
@@ -469,7 +560,7 @@ def export_to_csv(analyzer):
     buf.seek(0)
     return buf
 
-def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp):
+def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp, analyzer):
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
         with open(video_path, 'rb') as f:
@@ -477,27 +568,33 @@ def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp):
         zipf.writestr(f"report_{timestamp}.pdf", pdf_buf.getvalue())
         zipf.writestr(f"charts_{timestamp}.png", plot_buf.getvalue())
         zipf.writestr(f"data_{timestamp}.csv", csv_buf.getvalue())
-        if analyzer.best_frame_bytes:
-            zipf.writestr(f"best_frame_{timestamp}.jpg", analyzer.best_frame_bytes)
-        if analyzer.worst_frame_bytes:
-            zipf.writestr(f"worst_frame_{timestamp}.jpg", analyzer.worst_frame_bytes)
+        if analyzer.best_bytes:
+            zipf.writestr(f"best_frame_{timestamp}.jpg", analyzer.best_bytes)
+        if analyzer.worst_bytes:
+            zipf.writestr(f"worst_frame_{timestamp}.jpg", analyzer.worst_bytes)
     zip_buf.seek(0)
     return zip_buf
 
 # ─────────────────────────────────────────────
-# MAIN APP
+# MAIN STREAMLIT APP
 # ─────────────────────────────────────────────
 
 def main():
-    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro v4.0 – Final")
-    st.title("Freestyle Swim Technique Analyzer Pro – Final Merged & Fixed")
+    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro v4.1 – Fully Polished")
+    st.title("Freestyle Swim Technique Analyzer Pro – v4.1 (All Improvements Applied)")
 
     with st.sidebar:
+        st.header("Athlete & Analysis Settings")
         height = st.slider("Height (cm)", 150, 200, 170)
         discipline = st.selectbox("Discipline", ["pool", "triathlon"])
+        conf_thresh = st.slider("Min Detection Confidence", 0.3, 0.7, DEFAULT_CONF_THRESHOLD, 0.05)
+        yaw_thresh = st.slider("Breath Yaw Threshold", 0.05, 0.3, DEFAULT_YAW_THRESHOLD, 0.01)
+        torso_good_low = st.slider("Torso Good Low (°)", 2, 8, DEFAULT_TORSO_GOOD[0])
+        torso_good_high = st.slider("Torso Good High (°)", 8, 15, DEFAULT_TORSO_GOOD[1])
+        forearm_good_high = st.slider("Forearm Good Max (°)", 20, 50, DEFAULT_FOREARM_GOOD[1])
 
     athlete = AthleteProfile(height, discipline)
-    analyzer = SwimAnalyzer(athlete)
+    analyzer = SwimAnalyzer(athlete, conf_thresh, yaw_thresh)
 
     uploaded = st.file_uploader("Upload swimming video", type=["mp4", "mov"])
 
@@ -537,7 +634,8 @@ def main():
             plot_buf = generate_plots(analyzer)
             pdf_buf = generate_pdf_report(summary, uploaded.name, plot_buf)
             csv_buf = export_to_csv(analyzer)
-            zip_buf = create_results_bundle(out_path, csv_buf, pdf_buf, plot_buf, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+            zip_buf = create_results_bundle(out_path, csv_buf, pdf_buf, plot_buf,
+                                            datetime.datetime.now().strftime("%Y%m%d_%H%M%S"), analyzer)
 
             st.success("Analysis complete!")
 
@@ -559,10 +657,11 @@ def main():
 
             st.download_button("Download Full Analysis (ZIP)", zip_buf, f"swim_analysis.zip", "application/zip")
 
-            os.unlink(out_path)
+            if os.path.exists(out_path):
+                os.unlink(out_path)
 
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"Error during processing: {str(e)}")
             if os.path.exists(input_path): os.unlink(input_path)
             if os.path.exists(out_path): os.unlink(out_path)
 
