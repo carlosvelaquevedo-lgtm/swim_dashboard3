@@ -1,8 +1,7 @@
-# requirements.txt
 streamlit>=1.31.0
-opencv-python-headless>=4.9.0.80     # headless version to avoid libGL error
+opencv-python-headless>=4.10.0.84
 numpy>=1.26.0
 pandas>=2.2.0
 matplotlib>=3.8.0
 reportlab>=4.0.0
-pillow>=10.0.0                       # often needed by matplotlib/reportlab
+pillow>=10.0.0
