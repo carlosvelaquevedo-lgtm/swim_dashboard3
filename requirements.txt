@@ -1,7 +1,19 @@
-streamlit>=1.41.0
-opencv-python-headless>=4.10.0
-mediapipe>=0.10.14
-numpy>=1.26.0
-pandas>=2.2.0
-matplotlib>=3.9.0
-reportlab>=4.2.0
+# Core Framework
+streamlit>=1.28.0
+
+# Computer Vision & Pose Estimation
+opencv-python-headless>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+
+# Data Processing
+pandas>=2.0.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# PDF Report Generation
+reportlab>=4.0.0
+
+# Standard Library (included for reference)
+# math, statistics, enum, dataclasses, typing, tempfile, os, datetime, collections, io, zipfile
