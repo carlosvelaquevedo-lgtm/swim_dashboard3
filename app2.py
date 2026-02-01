@@ -1,3 +1,8 @@
+"""
+Freestyle Swimming Technique Analyzer Pro - Merged & Polished
+AI-powered freestyle analysis with MediaPipe + modern UI
+"""
+
 import streamlit as st
 import cv2
 import numpy as np
@@ -19,12 +24,101 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import mediapipe as mp  # for landmark enum compatibility only
+import mediapipe as mp
 
 # ─────────────────────────────────────────────
-# CONFIG CONSTANTS & DEFAULTS
+# CUSTOM CSS (from your working version - glassmorphism & modern look)
+# ─────────────────────────────────────────────
+
+CUSTOM_CSS = """
+<style>
+    .stApp {
+        background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%);
+    }
+    
+    .metric-card {
+        background: rgba(30, 41, 59, 0.7);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        padding: 20px;
+        border: 1px solid rgba(100, 116, 139, 0.3);
+        margin-bottom: 16px;
+    }
+    
+    .metric-card-green { border-left: 4px solid #22c55e; }
+    .metric-card-red   { border-left: 4px solid #ef4444; }
+    .metric-card-yellow{ border-left: 4px solid #eab308; }
+    
+    .score-card {
+        background: linear-gradient(135deg, #0891b2 0%, #2563eb 100%);
+        border-radius: 16px;
+        padding: 24px;
+        color: white;
+        margin-bottom: 24px;
+    }
+    
+    .drill-card {
+        background: rgba(15, 23, 42, 0.6);
+        border-radius: 12px;
+        padding: 16px;
+        border: 1px solid rgba(100, 116, 139, 0.3);
+        margin-bottom: 12px;
+    }
+    
+    .rec-high   { background: rgba(127, 29, 29, 0.3); border-left: 4px solid #ef4444; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .rec-medium { background: rgba(113, 63, 18, 0.3); border-left: 4px solid #eab308; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .rec-low    { background: rgba(20, 83, 45, 0.3); border-left: 4px solid #22c55e; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    
+    .stProgress > div > div > div > div {
+        background: linear-gradient(90deg, #06b6d4 0%, #3b82f6 100%);
+    }
+    
+    .stButton > button {
+        background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        padding: 12px 24px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 20px rgba(6, 182, 212, 0.3);
+    }
+    
+    .css-1d391kg { background: rgba(15, 23, 42, 0.9); }
+    
+    h1, h2, h3 { color: #f8fafc !important; }
+    p, span, label { color: #cbd5e1; }
+    
+    .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        background: rgba(15, 23, 42, 0.6);
+        border-radius: 8px;
+        margin-right: 8px;
+        margin-bottom: 8px;
+    }
+    
+    .legend-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+    }
+    
+    .legend-dot-green { background: #22c55e; }
+    .legend-dot-yellow { background: #eab308; }
+    .legend-dot-red { background: #ef4444; }
+    .legend-dot-white { background: #ffffff; }
+</style>
+"""
+
+# ─────────────────────────────────────────────
+# CONFIG & DEFAULTS
 # ─────────────────────────────────────────────
 
 DEFAULT_CONF_THRESHOLD = 0.5
@@ -51,19 +145,10 @@ class SwimPhase(Enum):
     PUSH = "Push"
     RECOVERY = "Recovery"
 
-class CameraView(Enum):
-    SIDE = "Side"
-    FRONT = "Front"
-    DIAGONAL = "Diagonal"
-    UNKNOWN = "Unknown"
-
 @dataclass
 class AthleteProfile:
     height_cm: float
     discipline: str
-
-    def roll_tolerance(self):
-        return 1.15 if self.discipline == "triathlon" else 1.0
 
 @dataclass
 class FrameMetrics:
@@ -116,7 +201,7 @@ class SessionSummary:
     recommendations: List[Recommendation] = field(default_factory=list)
 
 # ─────────────────────────────────────────────
-# GEOMETRY & HELPERS
+# HELPERS
 # ─────────────────────────────────────────────
 
 def calculate_angle(a, b, c):
@@ -156,14 +241,8 @@ def detect_local_minimum(arr, threshold=10):
     mid = len(arr) // 2
     return arr[mid] < min(arr[:mid] + arr[mid+1:]) and (arr[mid] + threshold) <= min(arr[:mid] + arr[mid+1:])
 
-def flip_if_upside_down(frame, lm_pixel):
-    if "left_hip" in lm_pixel and "left_shoulder" in lm_pixel:
-        if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
-            return cv2.flip(frame, -1)
-    return frame
-
 # ─────────────────────────────────────────────
-# VISUAL PANELS
+# VISUAL PANELS (from Grok + kick & breathing viz)
 # ─────────────────────────────────────────────
 
 def draw_simplified_silhouette(frame, x, y, color=(180,180,180), th=3):
@@ -230,7 +309,7 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, kick_dept
     cv2.putText(frame, stxt, (px+10, py+ph-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 1)
 
 # ─────────────────────────────────────────────
-# ANALYZER CLASS (Tasks API)
+# ANALYZER CLASS
 # ─────────────────────────────────────────────
 
 class SwimAnalyzer:
@@ -239,24 +318,13 @@ class SwimAnalyzer:
         self.conf_thresh = conf_thresh
         self.yaw_thresh = yaw_thresh
 
-        # MediaPipe Tasks API (stable on cloud)
-        BaseOptions = python.BaseOptions
-        PoseLandmarker = vision.PoseLandmarker
-        PoseLandmarkerOptions = vision.PoseLandmarkerOptions
-        VisionRunningMode = vision.RunningMode
-
-        base_options = BaseOptions(
-            model_asset_path="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-        )
-        options = PoseLandmarkerOptions(
-            base_options=base_options,
-            running_mode=VisionRunningMode.VIDEO,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
+        self.pose = mp.solutions.pose.Pose(
+            min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-            output_segmentation_masks=False
+            model_complexity=1
         )
-        self.pose_landmarker = PoseLandmarker.create_from_options(options)
+        self.drawing = mp.solutions.drawing_utils
+        self.styles = mp.solutions.drawing_styles
 
         self.metrics: List[FrameMetrics] = []
         self.stroke_times = []
@@ -276,41 +344,35 @@ class SwimAnalyzer:
 
     def process(self, frame, t):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp_ms = int(t * 1000)
-
-        result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-
-        if not result.pose_landmarks:
+        res = self.pose.process(rgb)
+        if not res.pose_landmarks:
             return frame, None
 
-        landmarks = result.pose_landmarks[0]
+        h, w = frame.shape[:2]
         lm_pixel = {}
-        for name in ["nose","left_shoulder","right_shoulder","left_elbow","right_elbow",
-                     "left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]:
+        names = ["nose","left_shoulder","right_shoulder","left_elbow","right_elbow",
+                 "left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"]
+        vis_sum = 0
+        for name in names:
             idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
-            p = landmarks[idx]
-            lm_pixel[name] = (p.x * frame.shape[1], p.y * frame.shape[0])
+            p = res.pose_landmarks.landmark[idx]
+            lm_pixel[name] = (p.x * w, p.y * h)
+            vis_sum += p.visibility
 
-        conf = statistics.mean([landmarks[getattr(mp.solutions.pose.PoseLandmark, n.upper())].presence
-                                for n in ["left_shoulder","right_shoulder","left_hip","right_hip"]])
-
+        conf = vis_sum / len(names)
         if conf < self.conf_thresh:
             return frame, None
 
-        # Flip if upside-down
         if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
             frame = cv2.flip(frame, -1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-            if not result.pose_landmarks:
+            res = self.pose.process(rgb)
+            if not res.pose_landmarks:
                 return frame, None
-            landmarks = result.pose_landmarks[0]
-            for name in lm_pixel:
+            for name in names:
                 idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
-                p = landmarks[idx]
-                lm_pixel[name] = (p.x * frame.shape[1], p.y * frame.shape[0])
+                p = res.pose_landmarks.landmark[idx]
+                lm_pixel[name] = (p.x * w, p.y * h)
 
         elbow = min(
             calculate_angle(lm_pixel["left_shoulder"], lm_pixel["left_elbow"], lm_pixel["left_wrist"]),
@@ -327,7 +389,7 @@ class SwimAnalyzer:
         kick_sym = abs(knee_l - knee_r)
         kick_depth_raw = compute_kick_depth_proxy(lm_pixel)
 
-        symmetry_hips = abs(lm_pixel["left_hip"][0] - lm_pixel["right_hip"][0]) / frame.shape[1] * 100
+        symmetry_hips = abs(lm_pixel["left_hip"][0] - lm_pixel["right_hip"][0]) / w * 100
 
         wrist_y = lm_pixel["left_wrist"][1]
         shoulder_y = lm_pixel["left_shoulder"][1]
@@ -374,7 +436,7 @@ class SwimAnalyzer:
         kick_depth = statistics.mean(self.kick_depth_buffer) if self.kick_depth_buffer else kick_depth_raw
         roll_abs = abs(roll)
 
-        self.drawing.draw_landmarks(frame, landmarks, mp.solutions.pose.POSE_CONNECTIONS,
+        self.drawing.draw_landmarks(frame, res.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS,
                                     landmark_drawing_spec=self.styles.get_default_pose_landmarks_style())
 
         draw_technique_panel(frame, w-200, "YOUR STROKE", torso, forearm, roll_abs, kick_depth, phase, False, self.breath_side)
@@ -445,7 +507,7 @@ class SwimAnalyzer:
         )
 
 # ─────────────────────────────────────────────
-# PLOTS, PDF, CSV, ZIP
+# PLOTS
 # ─────────────────────────────────────────────
 
 def generate_plots(analyzer):
@@ -463,6 +525,10 @@ def generate_plots(analyzer):
     axs[3].plot(times, [m.score for m in analyzer.metrics], label="Technique Score", color='lime'); axs[3].set_title("Technique Score Over Time"); axs[3].legend()
     buf = io.BytesIO(); plt.savefig(buf, format="png", dpi=150, bbox_inches="tight"); plt.close(fig); buf.seek(0)
     return buf
+
+# ─────────────────────────────────────────────
+# PDF REPORT
+# ─────────────────────────────────────────────
 
 def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.BytesIO) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -536,6 +602,10 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
     buffer.seek(0)
     return buffer
 
+# ─────────────────────────────────────────────
+# CSV & ZIP
+# ─────────────────────────────────────────────
+
 def export_to_csv(analyzer):
     data = {
         'time_s': [m.time_s for m in analyzer.metrics],
@@ -576,23 +646,23 @@ def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp, ana
 # ─────────────────────────────────────────────
 
 def main():
-    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro v4.2 – Fully Polished")
-    st.title("Freestyle Swim Technique Analyzer Pro – v4.2 (All Improvements Applied)")
+    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro – Polished UI")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    st.title("🏊 Freestyle Swim Technique Analyzer Pro")
+    st.markdown("AI-powered analysis with modern UI & detailed coaching feedback")
 
     with st.sidebar:
-        st.header("Athlete & Analysis Settings")
+        st.header("Athlete & Settings")
         height = st.slider("Height (cm)", 150, 200, 170)
         discipline = st.selectbox("Discipline", ["pool", "triathlon"])
-        conf_thresh = st.slider("Min Detection Confidence", 0.3, 0.7, DEFAULT_CONF_THRESHOLD, 0.05)
-        yaw_thresh = st.slider("Breath Yaw Threshold", 0.05, 0.3, DEFAULT_YAW_THRESHOLD, 0.01)
-        torso_good_low = st.slider("Torso Good Low (°)", 2, 8, DEFAULT_TORSO_GOOD[0])
-        torso_good_high = st.slider("Torso Good High (°)", 8, 15, DEFAULT_TORSO_GOOD[1])
-        forearm_good_high = st.slider("Forearm Good Max (°)", 20, 50, DEFAULT_FOREARM_GOOD[1])
+        conf_thresh = st.slider("Confidence Threshold", 0.3, 0.7, DEFAULT_CONF_THRESHOLD, 0.05)
+        yaw_thresh = st.slider("Yaw Threshold", 0.05, 0.3, DEFAULT_YAW_THRESHOLD, 0.01)
 
     athlete = AthleteProfile(height, discipline)
     analyzer = SwimAnalyzer(athlete, conf_thresh, yaw_thresh)
 
-    uploaded = st.file_uploader("Upload swimming video", type=["mp4", "mov"])
+    uploaded = st.file_uploader("Upload video", type=["mp4", "mov"])
 
     if uploaded:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
@@ -620,7 +690,7 @@ def main():
                 writer.write(annotated)
                 frame_idx += 1
                 progress.progress(frame_idx / total)
-                status.text(f"Frame {frame_idx}/{total}")
+                status.text(f"Processing frame {frame_idx}/{total}")
 
             cap.release()
             writer.release()
@@ -635,12 +705,22 @@ def main():
 
             st.success("Analysis complete!")
 
+            # Score card
+            st.markdown(f"""
+            <div class="score-card">
+                <h2>Technique Score</h2>
+                <div style="font-size: 48px; font-weight: bold;">{summary.avg_score:.1f}/100</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Metrics
             cols = st.columns(4)
             cols[0].metric("Stroke Rate", f"{summary.stroke_rate:.1f} spm")
             cols[1].metric("Breaths/min", f"{summary.breaths_per_min:.1f}")
             cols[2].metric("Avg Body Roll", f"{summary.avg_body_roll:.1f}°")
             cols[3].metric("Kick Depth", f"{summary.avg_kick_depth:.2f}", delta=summary.kick_status)
 
+            # Best/Worst frames
             col1, col2 = st.columns(2)
             with col1:
                 if summary.best_frame_bytes:
@@ -651,13 +731,13 @@ def main():
 
             st.video(out_path)
 
-            st.download_button("Download Full Analysis (ZIP)", zip_buf, f"swim_analysis.zip", "application/zip")
+            st.download_button("Download Full Bundle (ZIP)", zip_buf, "swim_analysis.zip", "application/zip")
 
             if os.path.exists(out_path):
                 os.unlink(out_path)
 
         except Exception as e:
-            st.error(f"Error during processing: {str(e)}")
+            st.error(f"Error: {str(e)}")
             if os.path.exists(input_path): os.unlink(input_path)
             if os.path.exists(out_path): os.unlink(out_path)
 
