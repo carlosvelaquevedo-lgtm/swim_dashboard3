@@ -19,10 +19,20 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-import mediapipe as mp
 
 # ─────────────────────────────────────────────
-# CUSTOM CSS (modern glassmorphism UI from your working version)
+# MEDIAPIPE IMPORT WITH ERROR HANDLING
+# ─────────────────────────────────────────────
+
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError as e:
+    MEDIAPIPE_AVAILABLE = False
+    st.error(f"MediaPipe import failed: {e}")
+
+# ─────────────────────────────────────────────
+# CUSTOM CSS (modern glassmorphism UI)
 # ─────────────────────────────────────────────
 
 CUSTOM_CSS = """
@@ -304,7 +314,7 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, kick_dept
     cv2.putText(frame, stxt, (px+10, py+ph-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 1)
 
 # ─────────────────────────────────────────────
-# ANALYZER CLASS (with model_complexity=0)
+# ANALYZER CLASS (FIXED FOR STREAMLIT CLOUD)
 # ─────────────────────────────────────────────
 
 class SwimAnalyzer:
@@ -312,15 +322,12 @@ class SwimAnalyzer:
         self.athlete = athlete
         self.conf_thresh = conf_thresh
         self.yaw_thresh = yaw_thresh
-
-        # Updated: model_complexity=0 (lite model – more reliable on cloud)
-        self.pose = mp.solutions.pose.Pose(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=0                      # ← CHANGED HERE
-        )
-        self.drawing = mp.solutions.drawing_utils
-        self.styles = mp.solutions.drawing_styles
+        self.pose = None
+        self.drawing = None
+        self.styles = None
+        
+        # Initialize MediaPipe with error handling
+        self._init_mediapipe()
 
         self.metrics: List[FrameMetrics] = []
         self.stroke_times = []
@@ -338,9 +345,56 @@ class SwimAnalyzer:
         self.forearm_buffer = deque(maxlen=7)
         self.kick_depth_buffer = deque(maxlen=7)
 
+    def _init_mediapipe(self):
+        """Initialize MediaPipe with multiple fallback options for cloud compatibility."""
+        if not MEDIAPIPE_AVAILABLE:
+            raise RuntimeError("MediaPipe is not available")
+        
+        # Try different configurations in order of preference
+        configs = [
+            # Config 1: Lite model, lower thresholds (most compatible)
+            {"model_complexity": 0, "min_detection_confidence": 0.3, "min_tracking_confidence": 0.3, "static_image_mode": False},
+            # Config 2: Lite model, static mode
+            {"model_complexity": 0, "min_detection_confidence": 0.3, "min_tracking_confidence": 0.3, "static_image_mode": True},
+            # Config 3: Lite model only
+            {"model_complexity": 0},
+        ]
+        
+        last_error = None
+        for i, config in enumerate(configs):
+            try:
+                self.pose = mp.solutions.pose.Pose(**config)
+                self.drawing = mp.solutions.drawing_utils
+                self.styles = mp.solutions.drawing_styles
+                # Test with a dummy image to ensure it works
+                test_img = np.zeros((100, 100, 3), dtype=np.uint8)
+                self.pose.process(test_img)
+                return  # Success!
+            except Exception as e:
+                last_error = e
+                if self.pose:
+                    try:
+                        self.pose.close()
+                    except:
+                        pass
+                    self.pose = None
+                continue
+        
+        # If all configs failed, raise the last error
+        raise RuntimeError(f"Failed to initialize MediaPipe after trying all configurations. Last error: {last_error}")
+
     def process(self, frame, t):
+        if self.pose is None:
+            return frame, None
+            
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = self.pose.process(rgb)
+        
+        try:
+            res = self.pose.process(rgb)
+        except Exception as e:
+            st.warning(f"Pose processing error: {e}")
+            return frame, None
+            
         if not res.pose_landmarks:
             return frame, None
 
@@ -363,7 +417,10 @@ class SwimAnalyzer:
             if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
                 frame = cv2.flip(frame, -1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = self.pose.process(rgb)
+                try:
+                    res = self.pose.process(rgb)
+                except:
+                    return frame, None
                 if not res.pose_landmarks:
                     return frame, None
                 for name in names:
@@ -433,8 +490,9 @@ class SwimAnalyzer:
         kick_depth = statistics.mean(self.kick_depth_buffer) if self.kick_depth_buffer else kick_depth_raw
         roll_abs = abs(roll)
 
-        self.drawing.draw_landmarks(frame, res.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS,
-                                    landmark_drawing_spec=self.styles.get_default_pose_landmarks_style())
+        if self.drawing and res.pose_landmarks:
+            self.drawing.draw_landmarks(frame, res.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS,
+                                        landmark_drawing_spec=self.styles.get_default_pose_landmarks_style())
 
         draw_technique_panel(frame, w-200, "YOUR STROKE", torso, forearm, roll_abs, kick_depth, phase, False, self.breath_side)
         draw_technique_panel(frame, 200, "IDEAL REFERENCE", 8.0, 20.0, 45.0, 0.4, "PULL", True, 'N')
@@ -463,6 +521,14 @@ class SwimAnalyzer:
         self.metrics.append(metrics)
 
         return frame, score
+
+    def close(self):
+        """Clean up MediaPipe resources."""
+        if self.pose:
+            try:
+                self.pose.close()
+            except:
+                pass
 
     def get_summary(self):
         if not self.metrics: return SessionSummary(0,0,0,0,0,0,0,0,0,0,0,"No data",1.0,None,None)
@@ -544,7 +610,7 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
         ['Date', datetime.datetime.now().strftime("%Y-%m-%d %H:%M")],
         ['Avg Confidence', f"{summary.avg_confidence*100:.1f}%"]
     ]
-    story.append(Table(session_data).setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)])))
+    story.append(Table(session_data, colWidths=[2*inch, 4*inch]))
     story.append(Spacer(1, 0.3*inch))
 
     story.append(Paragraph("Performance Metrics", styles['Heading2']))
@@ -558,9 +624,16 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
         ['Kick Symmetry', f"{summary.avg_kick_symmetry:.1f}°", summary.kick_status],
         ['Kick Depth Proxy', f"{summary.avg_kick_depth:.2f}", 'Good']
     ]
-    story.append(Table(metrics_data).setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)])))
+    t = Table(metrics_data, colWidths=[2*inch, 2*inch, 2*inch])
+    t.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1e3a5f')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+    ]))
+    story.append(t)
 
     if summary.best_frame_bytes or summary.worst_frame_bytes:
+        story.append(Spacer(1, 0.3*inch))
         story.append(Paragraph("Best & Worst Frames (Pull Phase)", styles['Heading2']))
         if summary.best_frame_bytes:
             best_img = RLImage(io.BytesIO(summary.best_frame_bytes))
@@ -590,9 +663,10 @@ def generate_pdf_report(summary: SessionSummary, filename: str, plot_buffer: io.
     if plot_buffer.getvalue():
         story.append(PageBreak())
         story.append(Paragraph("Analysis Charts", styles['Heading2']))
+        plot_buffer.seek(0)
         img = RLImage(plot_buffer)
         img.drawWidth = 7*inch
-        img.drawHeight = 5*inch
+        img.drawHeight = 9*inch
         story.append(img)
 
     pdf.build(story)
@@ -626,8 +700,9 @@ def export_to_csv(analyzer):
 def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp, analyzer):
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        with open(video_path, 'rb') as f:
-            zipf.writestr(f"annotated_{timestamp}.mp4", f.read())
+        if os.path.exists(video_path):
+            with open(video_path, 'rb') as f:
+                zipf.writestr(f"annotated_{timestamp}.mp4", f.read())
         zipf.writestr(f"report_{timestamp}.pdf", pdf_buf.getvalue())
         zipf.writestr(f"charts_{timestamp}.png", plot_buf.getvalue())
         zipf.writestr(f"data_{timestamp}.csv", csv_buf.getvalue())
@@ -643,11 +718,17 @@ def create_results_bundle(video_path, csv_buf, pdf_buf, plot_buf, timestamp, ana
 # ─────────────────────────────────────────────
 
 def main():
-    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro – Polished UI")
+    st.set_page_config(layout="wide", page_title="Freestyle Swim Analyzer Pro")
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
     st.title("🏊 Freestyle Swim Technique Analyzer Pro")
     st.markdown("AI-powered analysis with modern UI & detailed coaching feedback")
+
+    # Check MediaPipe availability
+    if not MEDIAPIPE_AVAILABLE:
+        st.error("❌ MediaPipe is not available. Please check installation.")
+        st.code("pip install mediapipe>=0.10.0")
+        return
 
     with st.sidebar:
         st.header("Athlete & Settings")
@@ -657,11 +738,18 @@ def main():
         yaw_thresh = st.slider("Yaw Threshold", 0.05, 0.3, DEFAULT_YAW_THRESHOLD, 0.01)
 
     athlete = AthleteProfile(height, discipline)
-    analyzer = SwimAnalyzer(athlete, conf_thresh, yaw_thresh)
 
     uploaded = st.file_uploader("Upload video", type=["mp4", "mov"])
 
     if uploaded:
+        # Initialize analyzer with error handling
+        try:
+            analyzer = SwimAnalyzer(athlete, conf_thresh, yaw_thresh)
+        except Exception as e:
+            st.error(f"❌ Failed to initialize pose detection: {e}")
+            st.info("This may be a temporary issue. Please try refreshing the page.")
+            return
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
             tmp_in.write(uploaded.getvalue())
             input_path = tmp_in.name
@@ -673,7 +761,8 @@ def main():
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         out_path = tempfile.mktemp(suffix=".mp4")
-        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
 
         progress = st.progress(0)
         status = st.empty()
@@ -686,12 +775,18 @@ def main():
                 annotated, _ = analyzer.process(frame, frame_idx / fps)
                 writer.write(annotated)
                 frame_idx += 1
-                progress.progress(frame_idx / total)
+                if total > 0:
+                    progress.progress(min(frame_idx / total, 1.0))
                 status.text(f"Processing frame {frame_idx}/{total}")
 
             cap.release()
             writer.release()
-            os.unlink(input_path)
+            
+            # Clean up input file
+            try:
+                os.unlink(input_path)
+            except:
+                pass
 
             summary = analyzer.get_summary()
             plot_buf = generate_plots(analyzer)
@@ -700,13 +795,17 @@ def main():
             zip_buf = create_results_bundle(out_path, csv_buf, pdf_buf, plot_buf,
                                             datetime.datetime.now().strftime("%Y%m%d_%H%M%S"), analyzer)
 
-            st.success("Analysis complete!")
+            # Clean up analyzer
+            analyzer.close()
+
+            st.success("✅ Analysis complete!")
 
             # Score card
+            score_color = "#22c55e" if summary.avg_score >= 70 else "#eab308" if summary.avg_score >= 50 else "#ef4444"
             st.markdown(f"""
             <div class="score-card">
-                <h2>Technique Score</h2>
-                <div style="font-size: 48px; font-weight: bold;">{summary.avg_score:.1f}/100</div>
+                <h2 style="margin:0; color:white;">Technique Score</h2>
+                <div style="font-size: 48px; font-weight: bold; color: {score_color};">{summary.avg_score:.1f}/100</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -726,17 +825,39 @@ def main():
                 if summary.worst_frame_bytes:
                     st.image(summary.worst_frame_bytes, caption="Worst Pull Frame")
 
-            st.video(out_path)
-
-            st.download_button("Download Full Bundle (ZIP)", zip_buf, "swim_analysis.zip", "application/zip")
-
+            # Video display
             if os.path.exists(out_path):
-                os.unlink(out_path)
+                st.video(out_path)
+
+            st.download_button("📦 Download Full Bundle (ZIP)", zip_buf, "swim_analysis.zip", "application/zip")
+
+            # Clean up output file
+            try:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+            except:
+                pass
 
         except Exception as e:
-            st.error(f"Error: {str(e)}")
-            if os.path.exists(input_path): os.unlink(input_path)
-            if os.path.exists(out_path): os.unlink(out_path)
+            st.error(f"❌ Error during processing: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+            
+            # Cleanup on error
+            try:
+                cap.release()
+                writer.release()
+                analyzer.close()
+            except:
+                pass
+            try:
+                if os.path.exists(input_path): os.unlink(input_path)
+            except:
+                pass
+            try:
+                if os.path.exists(out_path): os.unlink(out_path)
+            except:
+                pass
 
 if __name__ == "__main__":
     main()
