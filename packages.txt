@@ -1,6 +1,2 @@
-# packages.txt (apt packages for Streamlit Cloud)
 libgl1-mesa-glx
 libglib2.0-0
-libstdc++6
-libgomp1
-libprotobuf-dev
