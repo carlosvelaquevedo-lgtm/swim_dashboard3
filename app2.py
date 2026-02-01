@@ -1,8 +1,3 @@
-"""
-Freestyle Swimming Technique Analyzer Pro - Merged & Polished
-AI-powered freestyle analysis with MediaPipe + modern UI
-"""
-
 import streamlit as st
 import cv2
 import numpy as np
@@ -27,7 +22,7 @@ from reportlab.lib.units import inch
 import mediapipe as mp
 
 # ─────────────────────────────────────────────
-# CUSTOM CSS (from your working version - glassmorphism & modern look)
+# CUSTOM CSS (modern glassmorphism UI from your working version)
 # ─────────────────────────────────────────────
 
 CUSTOM_CSS = """
@@ -118,7 +113,7 @@ CUSTOM_CSS = """
 """
 
 # ─────────────────────────────────────────────
-# CONFIG & DEFAULTS
+# CONFIG CONSTANTS & DEFAULTS
 # ─────────────────────────────────────────────
 
 DEFAULT_CONF_THRESHOLD = 0.5
@@ -242,7 +237,7 @@ def detect_local_minimum(arr, threshold=10):
     return arr[mid] < min(arr[:mid] + arr[mid+1:]) and (arr[mid] + threshold) <= min(arr[:mid] + arr[mid+1:])
 
 # ─────────────────────────────────────────────
-# VISUAL PANELS (from Grok + kick & breathing viz)
+# VISUAL PANELS
 # ─────────────────────────────────────────────
 
 def draw_simplified_silhouette(frame, x, y, color=(180,180,180), th=3):
@@ -309,7 +304,7 @@ def draw_technique_panel(frame, origin_x, title, torso, forearm, roll, kick_dept
     cv2.putText(frame, stxt, (px+10, py+ph-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 1)
 
 # ─────────────────────────────────────────────
-# ANALYZER CLASS
+# ANALYZER CLASS (with model_complexity=0)
 # ─────────────────────────────────────────────
 
 class SwimAnalyzer:
@@ -318,10 +313,11 @@ class SwimAnalyzer:
         self.conf_thresh = conf_thresh
         self.yaw_thresh = yaw_thresh
 
+        # Updated: model_complexity=0 (lite model – more reliable on cloud)
         self.pose = mp.solutions.pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-            model_complexity=1
+            model_complexity=0                      # ← CHANGED HERE
         )
         self.drawing = mp.solutions.drawing_utils
         self.styles = mp.solutions.drawing_styles
@@ -363,16 +359,17 @@ class SwimAnalyzer:
         if conf < self.conf_thresh:
             return frame, None
 
-        if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
-            frame = cv2.flip(frame, -1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = self.pose.process(rgb)
-            if not res.pose_landmarks:
-                return frame, None
-            for name in names:
-                idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
-                p = res.pose_landmarks.landmark[idx]
-                lm_pixel[name] = (p.x * w, p.y * h)
+        if "left_hip" in lm_pixel and "left_shoulder" in lm_pixel:
+            if lm_pixel["left_hip"][1] < lm_pixel["left_shoulder"][1]:
+                frame = cv2.flip(frame, -1)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = self.pose.process(rgb)
+                if not res.pose_landmarks:
+                    return frame, None
+                for name in names:
+                    idx = getattr(mp.solutions.pose.PoseLandmark, name.upper())
+                    p = res.pose_landmarks.landmark[idx]
+                    lm_pixel[name] = (p.x * w, p.y * h)
 
         elbow = min(
             calculate_angle(lm_pixel["left_shoulder"], lm_pixel["left_elbow"], lm_pixel["left_wrist"]),
